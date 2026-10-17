@@ -188,10 +188,12 @@ static int16_t* native_wcscpy(const int16_t* src, int16_t* dst) {
 }
 
 static int16_t* native_wcsncpy(int16_t* dest, const int16_t* src, int count) {
+  // Copy at most `count` characters; pad with zeros only when the source ends first. A source of
+  // `count` characters or more is copied without a terminator, as wcsncpy does.
   int16_t* d = dest;
-  while (count-- && (*d++ = *src++))
-    ;
-  while (count--)
+  for (; count > 0 && *src; --count)
+    *d++ = *src++;
+  for (; count > 0; --count)
     *d++ = 0;
   return dest;
 }
