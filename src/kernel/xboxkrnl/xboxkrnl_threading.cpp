@@ -20,6 +20,7 @@
 
 #include <rex/chrono/clock.h>
 #include <rex/dbg.h>
+#include <rex/platform.h>
 #include <rex/kernel/xboxkrnl/private.h>
 #include <rex/kernel/xboxkrnl/threading.h>
 #include <rex/logging.h>
@@ -38,6 +39,12 @@
 #include <rex/system/xtypes.h>
 #include <rex/thread/atomic.h>
 #include <rex/thread/mutex.h>
+
+#if REX_ARCH_AMD64
+#include <immintrin.h>
+#elif REX_ARCH_ARM64 && defined(_MSC_VER)
+#include <intrin.h>
+#endif
 
 namespace rex::kernel::xboxkrnl {
 using namespace rex::system;
@@ -962,15 +969,43 @@ static void xeKfLowerIrql(PPCContext* ctx, unsigned char new_irql) {
   pcr->current_irql = new_irql;
 }
 
+// One iteration of a busy-wait loop (a hint to the processor and its hyperthread sibling).
+static inline void SpinPause() {
+#if REX_ARCH_AMD64
+  _mm_pause();
+#elif REX_ARCH_ARM64 && defined(_MSC_VER)
+  __yield();
+#elif REX_ARCH_ARM64
+  __asm__ __volatile__("yield");
+#endif
+}
+
 // Guest-memory spinlock helpers - store PCR address as owner (matching xenia).
 // PPCContext* provides r13 (PCR address) without needing XThread::GetCurrentThread().
+//
+// A guest spin lock guards a few instructions at DISPATCH_LEVEL, where the console never preempts
+// the holder, so a waiter spins on the lock word before it gives the processor away. Yielding
+// after every failed attempt, as before, cost a waiter a whole scheduling quantum on a loaded host
+// while the holder released the lock within microseconds: the XAudio2 render threads of Armored
+// Core: For Answer, contending for one voice list lock, lost 4-53 ms per audio frame that way.
 uint32_t xeKeKfAcquireSpinLock(PPCContext* ctx, X_KSPINLOCK* lock, bool change_irql) {
+  // ~0.3 ms with the ~140-cycle PAUSE of Skylake and later, ~0.02 ms with older ones.
+  constexpr uint32_t kSpinsBeforeYield = 8192;
   uint32_t old_irql = change_irql ? xeKfRaiseIrql(ctx, IRQL_DISPATCH) : 0;
   uint32_t pcr_addr = static_cast<uint32_t>(ctx->r13.u64);
   const uint32_t self = rex::byte_swap(pcr_addr);
   assert_true(lock->prcb_of_owner.value != self);  // self-deadlock detection
-  while (!rex::thread::atomic_cas(0u, self, &lock->prcb_of_owner.value)) {
-    rex::thread::MaybeYield();
+  volatile uint32_t* owner = &lock->prcb_of_owner.value;
+  while (!rex::thread::atomic_cas(0u, self, owner)) {
+    // Spin without bus locks until the lock looks free; yield only if it stays held.
+    uint32_t spins = 0;
+    while (*owner != 0 && spins < kSpinsBeforeYield) {
+      SpinPause();
+      ++spins;
+    }
+    if (spins == kSpinsBeforeYield) {
+      rex::thread::MaybeYield();
+    }
   }
   return old_irql;
 }
