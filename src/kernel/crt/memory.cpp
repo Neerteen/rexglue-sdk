@@ -7,25 +7,59 @@
  * @copyright   Copyright (c) 2026 Tom Clay <tomc@tctechstuff.com>
  * @license     BSD 3-Clause License
  */
+#include <cstdint>
 #include <cstring>
 
 #include <rex/hook.h>
+#include <rex/system/kernel_state.h>
+#include <rex/system/xmemory.h>
+#include <rex/thread/mutex.h>
 
 namespace rex::kernel::crt {
+
+// ---------------------------------------------------------------------------
+// Writes to watched physical memory
+// ---------------------------------------------------------------------------
+
+// Guest virtual addresses from 0xA0000000 up are the views of physical memory.
+constexpr uint32_t kPhysicalViewsBase = 0xA0000000;
+
+// A write into guest physical memory that the GPU caches (textures, vertex data) faults, and the
+// handler takes the global critical region, runs the invalidation callbacks and unprotects the
+// watched range around the page - for one range of the destination after another. While a large
+// copy runs through such memory, a thread that needs the region in between (every kernel object
+// lookup: KeSetEvent, KeReleaseSemaphore, waits) may not get it until the copy is done: a guest
+// loader copying textures held up the audio render thread 13-22 ms. Trigger the callbacks for
+// the whole destination at once instead, before writing, as the first fault would for its range.
+static void UnwatchDestination(void* dst, size_t n) {
+  if (!dst || !n || n > UINT32_MAX) {
+    return;
+  }
+  rex::memory::Memory* memory = rex::system::kernel_memory();
+  const uint32_t address = memory->HostToGuestVirtual(dst);
+  if (address < kPhysicalViewsBase || !memory->IsPhysicalMemoryWatched(address, uint32_t(n))) {
+    return;
+  }
+  memory->TriggerPhysicalMemoryCallbacks(rex::thread::global_critical_region::AcquireDirect(),
+                                         address, uint32_t(n), true, false);
+}
 
 // ---------------------------------------------------------------------------
 // Standard memory operations
 // ---------------------------------------------------------------------------
 
 static void* native_memcpy(void* dst, const void* src, size_t n) {
+  UnwatchDestination(dst, n);
   return std::memcpy(dst, src, n);
 }
 
 static void* native_memmove(void* dst, const void* src, size_t n) {
+  UnwatchDestination(dst, n);
   return std::memmove(dst, src, n);
 }
 
 static void* native_memset(void* dst, int val, size_t n) {
+  UnwatchDestination(dst, n);
   return std::memset(dst, val, n);
 }
 
@@ -38,18 +72,22 @@ static void* native_memchr(const void* ptr, int val, size_t n) {
 // ---------------------------------------------------------------------------
 
 static void* native_XMemCpy(void* dst, const void* src, size_t n) {
+  UnwatchDestination(dst, n);
   return std::memcpy(dst, src, n);
 }
 
 static void* native_XMemSet(void* dst, int val, size_t n) {
+  UnwatchDestination(dst, n);
   return std::memset(dst, val, n);
 }
 
 static void* native_XMemSet128(void* dst, int val, size_t n) {
+  UnwatchDestination(dst, n);
   return std::memset(dst, val, n);
 }
 
 static void* native_memset_vmx(void* dst, int val, size_t n) {
+  UnwatchDestination(dst, n);
   return std::memset(dst, val, n);
 }
 
@@ -60,6 +98,7 @@ static void* native_memset_vmx(void* dst, int val, size_t n) {
 static int native_memcpy_s(void* dst, size_t dstsz, const void* src, size_t count) {
   if (!dst || !src || count > dstsz)
     return 22;  // EINVAL
+  UnwatchDestination(dst, count);
   std::memcpy(dst, src, count);
   return 0;
 }
@@ -67,6 +106,7 @@ static int native_memcpy_s(void* dst, size_t dstsz, const void* src, size_t coun
 static int native_memmove_s(void* dst, size_t dstsz, const void* src, size_t count) {
   if (!dst || !src || count > dstsz)
     return 22;  // EINVAL
+  UnwatchDestination(dst, count);
   std::memmove(dst, src, count);
   return 0;
 }

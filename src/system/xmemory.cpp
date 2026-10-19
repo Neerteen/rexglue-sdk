@@ -10,6 +10,7 @@
  */
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <utility>
 
@@ -654,6 +655,14 @@ bool Memory::TriggerPhysicalMemoryCallbacks(
                                            length, is_write, unwatch_exact_range, unprotect);
   }
   return false;
+}
+
+bool Memory::IsPhysicalMemoryWatched(uint32_t virtual_address, uint32_t length) {
+  BaseHeap* heap = LookupHeap(virtual_address);
+  if (!heap || heap->heap_type() != memory::HeapType::kGuestPhysical) {
+    return false;
+  }
+  return static_cast<PhysicalHeap*>(heap)->IsWatched(virtual_address, length);
 }
 
 void* Memory::RegisterPhysicalMemoryInvalidationCallback(
@@ -2327,6 +2336,46 @@ bool PhysicalHeap::TriggerCallbacks(std::unique_lock<std::recursive_mutex> globa
   }
 
   return true;
+}
+
+bool PhysicalHeap::IsWatched(uint32_t virtual_address, uint32_t length) {
+  // The same clamping as TriggerCallbacks.
+  if (virtual_address < heap_base_) {
+    if (heap_base_ - virtual_address >= length) {
+      return false;
+    }
+    length -= heap_base_ - virtual_address;
+    virtual_address = heap_base_;
+  }
+  uint32_t heap_relative_address = virtual_address - heap_base_;
+  if (heap_relative_address >= heap_size_) {
+    return false;
+  }
+  length = std::min(length, heap_size_ - heap_relative_address);
+  if (length == 0) {
+    return false;
+  }
+  uint32_t system_page_first = (heap_relative_address + host_address_offset()) / system_page_size_;
+  uint32_t system_page_last = std::min(
+      (heap_relative_address + length - 1 + host_address_offset()) / system_page_size_,
+      system_page_count_ - 1);
+  uint32_t block_index_first = system_page_first >> 6;
+  uint32_t block_index_last = system_page_last >> 6;
+  for (uint32_t i = block_index_first; i <= block_index_last; ++i) {
+    // Written under the global critical region; a relaxed read is enough for a hint.
+    uint64_t block = std::atomic_ref<uint64_t>(system_page_flags_[i].notify_on_invalidation)
+                         .load(std::memory_order_relaxed);
+    if (i == block_index_first) {
+      block &= ~((uint64_t(1) << (system_page_first & 63)) - 1);
+    }
+    if (i == block_index_last && (system_page_last & 63) != 63) {
+      block &= (uint64_t(1) << ((system_page_last & 63) + 1)) - 1;
+    }
+    if (block) {
+      return true;
+    }
+  }
+  return false;
 }
 
 std::unique_lock<std::recursive_mutex> PhysicalHeap::AcquireHostPageReconcileLock() const {

@@ -319,6 +319,9 @@ class PhysicalHeap : public BaseHeap {
   bool TriggerCallbacks(std::unique_lock<std::recursive_mutex> global_lock_locked_once,
                         uint32_t virtual_address, uint32_t length, bool is_write,
                         bool unwatch_exact_range, bool unprotect = true);
+  // Whether any page in the range is watched, read without the global critical region (see
+  // Memory::IsPhysicalMemoryWatched).
+  bool IsWatched(uint32_t virtual_address, uint32_t length);
 
   uint32_t GetPhysicalAddress(uint32_t address) const;
 
@@ -509,6 +512,13 @@ class Memory {
   bool TriggerPhysicalMemoryCallbacks(
       std::unique_lock<std::recursive_mutex> global_lock_locked_once, uint32_t virtual_address,
       uint32_t length, bool is_write, bool unwatch_exact_range, bool unprotect = true);
+
+  // Whether a write to the virtual address range would hit a page with invalidation callbacks
+  // (a write watch) in a guest physical heap. The watch bits are read without the global critical
+  // region, so the answer can be stale: a watch enabled meanwhile is caught by the access
+  // violation as usual, and a watch already triggered costs only a TriggerPhysicalMemoryCallbacks
+  // call that finds nothing.
+  bool IsPhysicalMemoryWatched(uint32_t virtual_address, uint32_t length);
 
   // Allocates virtual memory from the 'system' heap.
   // System memory is kept separate from game memory but is still accessible
