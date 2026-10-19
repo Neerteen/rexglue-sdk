@@ -32,7 +32,10 @@ u32 XAudioGetSpeakerConfig_entry(mapped_u32 config_ptr) {
 u32 XAudioGetVoiceCategoryVolumeChangeMask_entry(mapped_void driver_ptr, mapped_u32 out_ptr) {
   assert_true((driver_ptr.guest_address() & 0xFFFF0000) == 0x41550000);
 
-  rex::thread::Sleep(std::chrono::microseconds(1));
+  // No yield here: XAudio2 calls this once per processing pass on its render thread, while the
+  // render driver callback waits for that pass. A yield (rex::thread::Sleep under 100 us is
+  // SwitchToThread) on a loaded host gave the processor away for a whole scheduling quantum, and
+  // the pass missed the output queue (Armored Core: For Answer, 12-34 ms per stall).
 
   // Checking these bits to see if any voice volume changed.
   // I think.
