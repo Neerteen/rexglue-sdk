@@ -12,6 +12,7 @@
 #pragma once
 
 #include <atomic>
+#include <mutex>
 #include <queue>
 
 #include <rex/kernel.h>
@@ -76,7 +77,11 @@ class AudioSystem : public system::IAudioSystem {
   std::atomic<bool> worker_running_ = {false};
   system::object_ref<system::XHostThread> worker_thread_;
 
-  rex::thread::global_critical_region global_critical_region_;
+  // Guards clients_. Not the global critical region: SubmitFrame runs on the render path of
+  // every audio frame, and the global lock is held for milliseconds by unrelated work (memory
+  // watch callbacks re-protecting pages, object creation). Order: clients_mutex_, then any lock
+  // the drivers or the heap take.
+  std::recursive_mutex clients_mutex_;
   static const size_t kMaximumClientCount = 8;
   struct {
     AudioDriver* driver;
