@@ -109,6 +109,28 @@ X_STATUS XFile::Read(uint32_t buffer_guest_address, uint32_t buffer_length, uint
                       notify_completion);
 }
 
+void XFile::ReadAsync(uint32_t buffer_guest_address, uint32_t buffer_length, uint64_t byte_offset,
+                      uint32_t apc_context, ReadCompletion completion) {
+  // As the NT I/O manager does for an asynchronous file object: the file's event is cleared when
+  // a request starts and set when it completes, so a wait on the file can't return early.
+  async_event_->Reset();
+  kernel_state()->QueueFileIo([file = retain_object(this), buffer_guest_address, buffer_length,
+                               byte_offset, apc_context, completion = std::move(completion)]() {
+    uint32_t bytes_read = 0;
+    X_STATUS result = file->Read(buffer_guest_address, buffer_length, byte_offset, &bytes_read,
+                                 apc_context, false);
+    completion(result, bytes_read);
+
+    XIOCompletion::IONotification notify;
+    notify.apc_context = apc_context;
+    notify.num_bytes = bytes_read;
+    notify.status = result;
+    file->NotifyIOCompletionPorts(notify);
+
+    file->async_event_->Set();
+  });
+}
+
 X_STATUS XFile::ReadInternal(uint32_t buffer_guest_address, uint32_t buffer_length,
                              uint64_t byte_offset, uint32_t* out_bytes_read, uint32_t apc_context,
                              bool notify_completion) {

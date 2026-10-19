@@ -321,6 +321,11 @@ class KernelState {
       std::function<X_RESULT(uint32_t&, uint32_t&)> completion_callback, uint32_t overlapped_ptr,
       std::function<void()> pre_callback = nullptr, std::function<void()> post_callback = nullptr);
 
+  // Runs fn on the kernel's file I/O thread, in the order queued: the asynchronous half of a
+  // read on a file opened without FILE_SYNCHRONOUS_IO_* (XFile::ReadAsync). Without the thread
+  // (before SetExecutableModule) fn runs at once on the caller.
+  void QueueFileIo(std::function<void()> fn);
+
   bool Save(stream::ByteStream* stream);
   bool Restore(stream::ByteStream* stream);
 
@@ -395,6 +400,13 @@ class KernelState {
   util::NativeList dpc_list_;
   std::condition_variable_any dispatch_cond_;
   std::list<std::function<void()>> dispatch_queue_;
+
+  // File I/O worker (QueueFileIo); the queue is guarded by file_io_mutex_.
+  std::atomic<bool> file_io_thread_running_{false};
+  object_ref<XHostThread> file_io_thread_;
+  std::mutex file_io_mutex_;
+  std::condition_variable file_io_cond_;
+  std::list<std::function<void()>> file_io_queue_;
 
   friend class XObject;
 };

@@ -170,6 +170,16 @@ KernelState::~KernelState() {
     dispatch_thread_->Wait(0, 0, 0, nullptr);
   }
 
+  // Same for the file I/O thread; requests still queued are dropped.
+  if (file_io_thread_running_) {
+    {
+      std::lock_guard<std::mutex> lock(file_io_mutex_);
+      file_io_thread_running_ = false;
+    }
+    file_io_cond_.notify_all();
+    file_io_thread_->Wait(0, 0, 0, nullptr);
+  }
+
   // Unload through UnloadUserModule so the recompiled-DLL teardown runs.
   // call_entry=false because guest DllMain is unsafe at shutdown.
   while (!user_modules_.empty()) {
@@ -683,6 +693,35 @@ void KernelState::SetExecutableModule(object_ref<UserModule> module) {
       dispatch_thread_running_ = false;
       dispatch_thread_.reset();
       REX_FATAL("Failed to create kernel dispatch thread (status {:#x})", create_status);
+    }
+  }
+
+  // Spin up the file I/O worker for asynchronous reads (QueueFileIo). Unlike the dispatch
+  // worker it runs requests without the global critical region and without a delay.
+  if (!file_io_thread_running_) {
+    file_io_thread_running_ = true;
+    file_io_thread_ = object_ref<XHostThread>(new XHostThread(this, 128 * 1024, 0, [this]() {
+      std::unique_lock<std::mutex> lock(file_io_mutex_);
+      while (true) {
+        file_io_cond_.wait(lock,
+                           [this]() { return !file_io_queue_.empty() || !file_io_thread_running_; });
+        if (!file_io_thread_running_) {
+          break;
+        }
+        auto fn = std::move(file_io_queue_.front());
+        file_io_queue_.pop_front();
+        lock.unlock();
+        fn();
+        lock.lock();
+      }
+      return 0;
+    }));
+    file_io_thread_->set_name("Kernel File I/O");
+    X_STATUS create_status = file_io_thread_->Create();
+    if (XFAILED(create_status)) {
+      file_io_thread_running_ = false;
+      file_io_thread_.reset();
+      REX_FATAL("Failed to create kernel file I/O thread (status {:#x})", create_status);
     }
   }
 
@@ -1242,6 +1281,21 @@ void KernelState::CompleteOverlappedDeferredEx(
         }
       });
   dispatch_cond_.notify_all();
+}
+
+void KernelState::QueueFileIo(std::function<void()> fn) {
+  {
+    std::lock_guard<std::mutex> lock(file_io_mutex_);
+    if (file_io_thread_running_) {
+      file_io_queue_.push_back(std::move(fn));
+      fn = nullptr;
+    }
+  }
+  if (fn) {
+    fn();
+    return;
+  }
+  file_io_cond_.notify_one();
 }
 
 DPCImpersonationScope KernelState::BeginDPCImpersonation() {

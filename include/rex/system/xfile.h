@@ -12,6 +12,7 @@
 
 #include <string>
 #include <filesystem>
+#include <functional>
 #include <mutex>
 
 #include <rex/filesystem/device.h>
@@ -92,6 +93,14 @@ class XFile : public XObject {
   // critical region).
   X_STATUS Read(uint32_t buffer_guess_address, uint32_t buffer_length, uint64_t byte_offset,
                 uint32_t* out_bytes_read, uint32_t apc_context, bool notify_completion = true);
+
+  // Asynchronous read, for a file opened without FILE_SYNCHRONOUS_IO_*. Clears the file's wait
+  // handle and returns; the read runs on the kernel's file I/O thread (KernelState::QueueFileIo),
+  // which then calls completion with the status and the bytes read, notifies the completion
+  // ports and signals the file. The buffer must stay valid until then.
+  using ReadCompletion = std::function<void(X_STATUS result, uint32_t bytes_read)>;
+  void ReadAsync(uint32_t buffer_guest_address, uint32_t buffer_length, uint64_t byte_offset,
+                 uint32_t apc_context, ReadCompletion completion);
 
   X_STATUS ReadScatter(uint32_t segments_guest_address, uint32_t length, uint64_t byte_offset,
                        uint32_t* out_bytes_read, uint32_t apc_context);

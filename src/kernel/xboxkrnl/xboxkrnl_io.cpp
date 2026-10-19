@@ -12,6 +12,8 @@
 // Disable warnings about unused parameters for kernel functions
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
+#include <atomic>
+
 #include <rex/filesystem/device.h>
 #include <rex/kernel/xboxkrnl/private.h>
 #include <rex/logging.h>
@@ -210,7 +212,15 @@ u32 NtReadFile_entry(u32 file_handle, u32 event_handle, mapped_void apc_routine_
   }
 
   if (XSUCCEEDED(result)) {
-    if (true || file->is_synchronous()) {
+    // A file opened without FILE_SYNCHRONOUS_IO_* reads asynchronously, as on the console: the
+    // call returns STATUS_PENDING and the kernel's file I/O thread completes the request. Games
+    // issue such reads while holding their own locks (XACT streams wave banks this way, under
+    // its engine lock that the audio thread takes every frame), so a blocking read from a slow
+    // disk stalled audio rendering. Reads without an offset, of zero bytes or at or past the end
+    // of the file (STATUS_END_OF_FILE is returned at once) still complete here.
+    const bool asynchronous = !file->is_synchronous() && byte_offset_ptr && buffer_length &&
+                              byte_offset < file->entry()->size();
+    if (!asynchronous) {
       // Synchronous.
       uint32_t bytes_read = 0;
       result = file->Read(buffer.guest_address(), buffer_length,
@@ -249,23 +259,38 @@ u32 NtReadFile_entry(u32 file_handle, u32 event_handle, mapped_void apc_routine_
       // we have written the info out.
       signal_event = true;
     } else {
-      // TODO(benvanik): async.
-
-      // X_STATUS_PENDING if not returning immediately.
-      // XFile is waitable and signalled after each async req completes.
-      // reset the input event (->Reset())
-      /*xeNtReadFileState* call_state = new xeNtReadFileState();
-      XAsyncRequest* request = new XAsyncRequest(
-      state, file,
-      (XAsyncRequest::CompletionCallback)xeNtReadFileCompleted,
-      call_state);*/
-      // result = file->Read(buffer.guest_address(), buffer_length, byte_offset,
-      //                     request);
+      // Asynchronous. The status block and the event belong to the request from here on: the
+      // file I/O thread may complete it before this call returns, so nothing below touches them.
       if (io_status_block) {
         io_status_block->status = X_STATUS_PENDING;
         io_status_block->information = 0;
       }
-
+      if (ev) {
+        ev->Reset();
+      }
+      auto* memory = REX_KERNEL_MEMORY();
+      const uint32_t iosb_ptr = io_status_block.guest_address();
+      const uint32_t apc_routine = static_cast<uint32_t>(apc_routine_ptr) & ~1u;
+      const uint32_t apc_ctx = apc_context.guest_address();
+      // The APC goes to the requesting thread, as for the synchronous path.
+      auto thread = retain_object(XThread::GetCurrentThread());
+      file->ReadAsync(buffer.guest_address(), buffer_length, byte_offset, apc_ctx,
+                      [memory, iosb_ptr, ev, thread, apc_routine, apc_ctx](X_STATUS read_result,
+                                                                           uint32_t bytes_read) {
+                        if (iosb_ptr) {
+                          auto iosb = memory->TranslateVirtual<X_IO_STATUS_BLOCK*>(iosb_ptr);
+                          iosb->information = bytes_read;
+                          // Pollers check the status: it must not be seen before the length.
+                          std::atomic_thread_fence(std::memory_order_release);
+                          iosb->status = read_result;
+                        }
+                        if (apc_routine && apc_ctx && read_result == X_STATUS_SUCCESS && thread) {
+                          thread->EnqueueApc(apc_routine, apc_ctx, iosb_ptr, 0);
+                        }
+                        if (ev) {
+                          ev->Set(0, false);
+                        }
+                      });
       result = X_STATUS_PENDING;
     }
   }
@@ -279,7 +304,8 @@ u32 NtReadFile_entry(u32 file_handle, u32 event_handle, mapped_void apc_routine_
     ev->Set(0, false);
   }
 
-  // Log detailed completion info for debugging async IO issues
+  // Log detailed completion info for debugging async IO issues (for an asynchronous read the
+  // status block may already hold the completion)
   if (file) {
     REXKRNL_IMPORT_RESULT(
         "NtReadFile",
