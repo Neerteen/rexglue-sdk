@@ -204,6 +204,11 @@ class XmaContext {
   explicit XmaContext();
   ~XmaContext();
 
+  // Opens a decoder, decodes one silent frame with it and closes it, so that the code of the
+  // open and of the per-frame path is paged in and the static tables are built now rather than
+  // on the first decode (XmaDecoder::Setup).
+  static void WarmUpDecoder();
+
   int Setup(uint32_t id, memory::Memory* memory, uint32_t guest_ptr);
   bool Work();
 

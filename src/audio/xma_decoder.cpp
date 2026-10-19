@@ -122,6 +122,13 @@ X_STATUS XmaDecoder::Setup(system::KernelState* kernel_state) {
   register_file_[XmaRegister::NextContextIndex] = 1;
   context_bitmap_.Resize(kContextCount);
 
+  // Contexts open their decoder on the first decode, inside the guest's kick register write on
+  // its audio thread. The first open and the first decode of the process page in the decoder's
+  // code and build its static tables: with the runtime's pages not yet in the file cache they
+  // took 10-37 ms (about 1 ms of it CPU) at the start of the first wave and delayed the audio
+  // render callback as much. Pay that here, at startup.
+  XmaContext::WarmUpDecoder();
+
   worker_running_ = true;
   work_event_ = rex::thread::Event::CreateAutoResetEvent(false);
   assert_not_null(work_event_);

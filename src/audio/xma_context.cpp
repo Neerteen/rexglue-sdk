@@ -55,6 +55,39 @@ XmaContext::~XmaContext() {
   }
 }
 
+void XmaContext::WarmUpDecoder() {
+  // One silent mono frame, laid out as PreparePacket hands frames to the decoder: a byte with the
+  // padding bit counts (none before the frame, one after it), then a 31-bit frame: its length (15
+  // bits), one 512-sample subframe (the fixed layout bit, then the full length bit), a zero DRC
+  // gain (8 bits), no skip samples, no extended header, the reserved bit, no coefficients, the bit
+  // the frame length leaves over and the trailer bit (no frame follows). FFmpeg's bit readers may
+  // read past the end of a packet, hence the zero padding.
+  static const uint8_t kSilentFrame[5 + AV_INPUT_BUFFER_PADDING_SIZE] = {0x04, 0x00, 0x3F, 0x00,
+                                                                          0x00};
+
+  const AVCodec* codec = avcodec_find_decoder(AV_CODEC_ID_XMAFRAMES);
+  AVCodecContext* context = codec ? avcodec_alloc_context3(codec) : nullptr;
+  AVPacket* packet = av_packet_alloc();
+  AVFrame* frame = av_frame_alloc();
+  if (context && packet && frame) {
+    context->sample_rate = 48000;
+    context->channels = 1;
+    context->flags2 |= AV_CODEC_FLAG2_SKIP_MANUAL;
+    if (avcodec_open2(context, codec, NULL) < 0) {
+      REXAPU_WARN("XmaContext: decoder warm-up failed to open the codec");
+    } else {
+      packet->data = const_cast<uint8_t*>(kSilentFrame);
+      packet->size = 5;
+      if (avcodec_send_packet(context, packet) < 0 || avcodec_receive_frame(context, frame) < 0) {
+        REXAPU_WARN("XmaContext: decoder warm-up failed to decode its frame");
+      }
+    }
+  }
+  av_frame_free(&frame);
+  av_packet_free(&packet);
+  avcodec_free_context(&context);
+}
+
 int XmaContext::Setup(uint32_t id, memory::Memory* memory, uint32_t guest_ptr) {
   id_ = id;
   memory_ = memory;
