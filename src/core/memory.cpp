@@ -17,9 +17,25 @@
 #endif
 
 #include <algorithm>
+#include <atomic>
 
 namespace rex {
 namespace memory {
+
+namespace {
+std::atomic<ProtectionChangeObserver> g_protection_change_observer{nullptr};
+}  // namespace
+
+void SetProtectionChangeObserver(ProtectionChangeObserver observer) {
+  g_protection_change_observer.store(observer, std::memory_order_release);
+}
+
+void NotifyProtectionChange(void* base_address, size_t length) {
+  ProtectionChangeObserver observer = g_protection_change_observer.load(std::memory_order_acquire);
+  if (observer) {
+    observer(base_address, length);
+  }
+}
 
 // TODO(benvanik): fancy AVX versions.
 // https://github.com/gnuradio/volk/blob/master/kernels/volk/volk_16u_byteswap.h

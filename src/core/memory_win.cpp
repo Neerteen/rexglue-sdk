@@ -110,10 +110,14 @@ void* AllocFixed(void* base_address, size_t length, AllocationType allocation_ty
   }
   DWORD protect = ToWin32ProtectFlags(access);
 #ifdef REX_BASE_MEMORY_WIN_USE_DESKTOP_FUNCTIONS
-  return VirtualAlloc(base_address, length, alloc_type, protect);
+  void* result = VirtualAlloc(base_address, length, alloc_type, protect);
 #else
-  return VirtualAllocFromApp(base_address, length, ULONG(alloc_type), ULONG(protect));
+  void* result = VirtualAllocFromApp(base_address, length, ULONG(alloc_type), ULONG(protect));
 #endif
+  if (result) {
+    NotifyProtectionChange(result, length);
+  }
+  return result;
 }
 
 bool DeallocFixed(void* base_address, size_t length, DeallocationType deallocation_type) {
@@ -130,7 +134,11 @@ bool DeallocFixed(void* base_address, size_t length, DeallocationType deallocati
       assert_unhandled_case(deallocation_type);
       break;
   }
-  return VirtualFree(base_address, length, free_type) ? true : false;
+  if (!VirtualFree(base_address, length, free_type)) {
+    return false;
+  }
+  NotifyProtectionChange(base_address, length);
+  return true;
 }
 
 bool Protect(void* base_address, size_t length, PageAccess access, PageAccess* out_old_access) {
@@ -148,6 +156,7 @@ bool Protect(void* base_address, size_t length, PageAccess access, PageAccess* o
   if (!result) {
     return false;
   }
+  NotifyProtectionChange(base_address, length);
   if (out_old_access) {
     *out_old_access = ToXeniaProtectFlags(DWORD(old_protect));
   }
@@ -216,8 +225,12 @@ void* MapFileView(FileMappingHandle handle, void* base_address, size_t length, P
       assert_unhandled_case(access);
       return nullptr;
   }
-  return MapViewOfFileEx(reinterpret_cast<HANDLE>(handle), file_access, target_address_high,
-                         target_address_low, length, base_address);
+  void* mapping = MapViewOfFileEx(reinterpret_cast<HANDLE>(handle), file_access,
+                                  target_address_high, target_address_low, length, base_address);
+  if (mapping) {
+    NotifyProtectionChange(mapping, length);
+  }
+  return mapping;
 #else
   // VirtualAlloc2FromApp and MapViewOfFile3FromApp were added in 10.0.17134.0.
   // https://docs.microsoft.com/en-us/uwp/win32-and-com/win32-apis
@@ -235,12 +248,17 @@ void* MapFileView(FileMappingHandle handle, void* base_address, size_t length, P
     VirtualFree(placeholder, length, MEM_RELEASE);
     return nullptr;
   }
+  NotifyProtectionChange(mapping, length);
   return mapping;
 #endif
 }
 
 bool UnmapFileView(FileMappingHandle handle, void* base_address, size_t length) {
-  return UnmapViewOfFile(base_address) ? true : false;
+  if (!UnmapViewOfFile(base_address)) {
+    return false;
+  }
+  NotifyProtectionChange(base_address, length);
+  return true;
 }
 
 }  // namespace memory

@@ -109,6 +109,16 @@ bool Protect(void* base_address, size_t length, PageAccess access,
 // the region.
 bool QueryProtect(void* base_address, size_t& length, PageAccess& access_out);
 
+// Called after AllocFixed, DeallocFixed, Protect, MapFileView or UnmapFileView has succeeded,
+// on the thread that called it, with the range whose page protection may have changed (length 0:
+// the whole allocation at base_address). Lets code that adds page attributes of its own (such as
+// PAGE_GUARD, which a new protection replaces) learn when they may be gone without querying the
+// pages. One observer per process; nullptr removes it. It must not change page protection.
+using ProtectionChangeObserver = void (*)(void* base_address, size_t length);
+void SetProtectionChangeObserver(ProtectionChangeObserver observer);
+// For the platform implementations of the functions above.
+void NotifyProtectionChange(void* base_address, size_t length);
+
 // Allocates a block of memory for a type with the given alignment.
 // The memory must be freed with AlignedFree.
 template <typename T>

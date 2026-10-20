@@ -237,8 +237,10 @@ static PageAccess PermsToPageAccess(const char perms[5]) {
 }  // namespace
 #endif  // REX_PLATFORM_LINUX
 
-void* AllocFixed(void* base_address, size_t length, AllocationType allocation_type,
-                 PageAccess access) {
+namespace {
+
+void* AllocFixedImpl(void* base_address, size_t length, AllocationType allocation_type,
+                     PageAccess access) {
   // Emulates Windows VirtualAlloc behavior:
   // - Reserve: create PROT_NONE mapping to hold address space
   // - Commit on existing reservation: mprotect to enable access (EEXIST path)
@@ -316,6 +318,17 @@ void* AllocFixed(void* base_address, size_t length, AllocationType allocation_ty
   return nullptr;
 }
 
+}  // namespace
+
+void* AllocFixed(void* base_address, size_t length, AllocationType allocation_type,
+                 PageAccess access) {
+  void* result = AllocFixedImpl(base_address, length, allocation_type, access);
+  if (result) {
+    NotifyProtectionChange(result, length);
+  }
+  return result;
+}
+
 bool DeallocFixed(void* base_address, size_t length, DeallocationType deallocation_type) {
   switch (deallocation_type) {
     case DeallocationType::kDecommit: {
@@ -326,10 +339,15 @@ bool DeallocFixed(void* base_address, size_t length, DeallocationType deallocati
 #if defined(MADV_DONTNEED)
       (void)madvise(base_address, length, MADV_DONTNEED);
 #endif
+      NotifyProtectionChange(base_address, length);
       return true;
     }
     case DeallocationType::kRelease: {
-      return munmap(base_address, length) == 0;
+      if (munmap(base_address, length) != 0) {
+        return false;
+      }
+      NotifyProtectionChange(base_address, length);
+      return true;
     }
     default:
       // how we get here? :(
@@ -369,8 +387,10 @@ bool Protect(void* base_address, size_t length, PageAccess access, PageAccess* o
   if (ret != 0) {
     REXSYS_ERROR("mprotect({}, 0x{:X}, {}) failed: {} ({})", base_address, length, prot,
                  strerror(errno), errno);
+    return false;
   }
-  return ret == 0;
+  NotifyProtectionChange(base_address, length);
+  return true;
 }
 
 bool QueryProtect(void* base_address, size_t& length, PageAccess& access_out) {
@@ -525,11 +545,16 @@ void* MapFileView(FileMappingHandle handle, void* base_address, size_t length, P
     return nullptr;
   }
 
+  NotifyProtectionChange(result, length);
   return result;
 }
 
 bool UnmapFileView(FileMappingHandle handle, void* base_address, size_t length) {
-  return munmap(base_address, length) == 0;
+  if (munmap(base_address, length) != 0) {
+    return false;
+  }
+  NotifyProtectionChange(base_address, length);
+  return true;
 }
 
 }  // namespace memory
