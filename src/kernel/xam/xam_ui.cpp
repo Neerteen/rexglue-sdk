@@ -413,13 +413,13 @@ class KeyboardInputDialog : public XamDialog {
       }
       if (ImGui::InputText("##body", text_buffer_.data(), text_buffer_.size(),
                            ImGuiInputTextFlags_EnterReturnsTrue)) {
-        text_ = std::string(text_buffer_.data(), text_buffer_.size());
+        text_ = BufferText();
         cancelled_ = false;
         ImGui::CloseCurrentPopup();
         Close();
       }
       if (ImGui::Button("OK")) {
-        text_ = std::string(text_buffer_.data(), text_buffer_.size());
+        text_ = BufferText();
         cancelled_ = false;
         ImGui::CloseCurrentPopup();
         Close();
@@ -439,6 +439,12 @@ class KeyboardInputDialog : public XamDialog {
   }
 
  private:
+  // The text up to the terminator. ImGui leaves stale bytes after it once the text gets
+  // shorter, and they can be the tail of a multibyte character, which is not valid UTF-8.
+  std::string BufferText() const {
+    return std::string(text_buffer_.data(), strnlen(text_buffer_.data(), text_buffer_.size()));
+  }
+
   bool has_opened_ = false;
   std::string title_;
   std::string description_;
