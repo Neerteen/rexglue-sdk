@@ -521,9 +521,40 @@ struct ParsedTextureFetchInstruction {
   // is not always zero.
   uint32_t GetNonZeroResultComponents() const;
 
+  // Whether the fetch can return a single texel with no instruction override to
+  // linear/anisotropic filtering.
+  bool AllowsPointSampling(bool use_computed_lod) const {
+    return attributes.mag_filter != xenos::TextureFilter::kLinear &&
+           attributes.min_filter != xenos::TextureFilter::kLinear &&
+           attributes.mip_filter != xenos::TextureFilter::kLinear &&
+           (!use_computed_lod || attributes.aniso_filter == xenos::AnisoFilter::kDisabled ||
+            attributes.aniso_filter == xenos::AnisoFilter::kUseFetchConst);
+  }
+
+  // Whether a tfetch snaps its coordinates to the texel center instead of
+  // adding kTextureCoordEpsilon. Only point sampled 2D fetches with normalized
+  // coordinates snap, and only if the fetch constant is point sampled too (the
+  // translators check that in the shader). The epsilon is there so host
+  // rounding picks the texel guest trunc would, but near an edge it can push
+  // the sample into the next texel.
+  bool CanSnapToTexelCenter(bool use_computed_lod) const {
+    return opcode == ucode::FetchOpcode::kTextureFetch &&
+           dimension == xenos::FetchOpDimension::k2D && !attributes.unnormalized_coordinates &&
+           AllowsPointSampling(use_computed_lod);
+  }
+
   // Disassembles the instruction into ucode assembly text.
   void Disassemble(string::StringBuffer* out) const;
 };
+
+// Fixed point texture coordinate ULP (see ProcessTextureFetchInstruction).
+constexpr float kTextureCoordEpsilon = 1.5f / 1024.0f;
+
+// Bits of fetch constant dword 3 that are all zero if the fetch constant is
+// point sampled: mag_filter and min_filter kPoint, mip_filter kPoint or
+// kBaseMap (bit 23 clear), aniso_filter kDisabled.
+constexpr uint32_t kTextureFetchConstantWord3NotPointMask =
+    (UINT32_C(3) << 19) | (UINT32_C(3) << 21) | (UINT32_C(1) << 23) | (UINT32_C(7) << 25);
 
 struct ParsedAluInstruction {
   // Opcode for the vector part of the instruction.

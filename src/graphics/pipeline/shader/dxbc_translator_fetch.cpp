@@ -684,6 +684,9 @@ void DxbcShaderTranslator::ProcessTextureFetchInstruction(
     return;
   }
 
+  // Texel center snap instead of the epsilon, see CanSnapToTexelCenter.
+  bool point_snap = instr.CanSnapToTexelCenter(use_computed_lod);
+
   // Get offsets applied to the coordinates before sampling.
   // `offsets` is used for float4 literal construction,
   // FIXME(Triang3l): Offsets need to be applied at the LOD being fetched, not
@@ -710,7 +713,7 @@ void DxbcShaderTranslator::ProcessTextureFetchInstruction(
     // sampling apparently round differently, so `mul` gives a value that would
     // be floored as expected, but the left/upper pixel is still sampled
     // instead.
-    const float rounding_offset = 1.5f / 1024.0f;
+    const float rounding_offset = point_snap ? 0.0f : kTextureCoordEpsilon;
     switch (instr.dimension) {
       case xenos::FetchOpDimension::k1D:
         offsets[0] = instr.attributes.offset_x + rounding_offset;
@@ -796,7 +799,7 @@ void DxbcShaderTranslator::ProcessTextureFetchInstruction(
   } else {
     // Size needed for normalization (or, for stacked texture layers,
     // denormalization) and for offsets.
-    size_needed_components |= offsets_not_zero;
+    size_needed_components |= offsets_not_zero | (point_snap ? 0b0011 : 0);
     switch (instr.dimension) {
       case xenos::FetchOpDimension::k1D:
         if (instr.attributes.unnormalized_coordinates) {
@@ -1554,6 +1557,46 @@ void DxbcShaderTranslator::ProcessTextureFetchInstruction(
                                sampler_bindless_descriptor_index >> 2)
                      .Select(sampler_bindless_descriptor_index & 3));
         sampler = dxbc::Src::S(0, dxbc::Index(coord_and_sampler_temp, 3));
+      }
+
+      if (point_snap) {
+        // A point sampled fetch constant uses the texel center in host texels
+        // (for a resolution scaled texture) instead of the epsilon. The result
+        // register is still free until the sample.
+        dxbc::Src snap_size(dxbc::Src::R(size_and_is_3d_temp));
+        a_.OpAnd(dxbc::Dest::R(system_temp_result_, 0b0001),
+                 RequestTextureFetchConstantWord(tfetch_index, 3),
+                 dxbc::Src::LU(kTextureFetchConstantWord3NotPointMask));
+        a_.OpIf(false, dxbc::Src::R(system_temp_result_, dxbc::Src::kXXXX));
+        if (draw_resolution_scale_x_ > 1 || draw_resolution_scale_y_ > 1) {
+          a_.OpAnd(dxbc::Dest::R(system_temp_result_, 0b0100),
+                   LoadSystemConstant(SystemConstants::Index::kTexturesResolutionScaled,
+                                      offsetof(SystemConstants, textures_resolution_scaled),
+                                      dxbc::Src::kXXXX),
+                   dxbc::Src::LU(UINT32_C(1) << tfetch_index));
+          a_.OpMovC(dxbc::Dest::R(system_temp_result_, 0b1100),
+                    dxbc::Src::R(system_temp_result_, dxbc::Src::kZZZZ),
+                    dxbc::Src::LF(0.0f, 0.0f, float(draw_resolution_scale_x_),
+                                  float(draw_resolution_scale_y_)),
+                    dxbc::Src::LF(1.0f));
+          // ZW = scale * size.xy (swizzle XYXY), then ZWZW is the host size.
+          a_.OpMul(dxbc::Dest::R(system_temp_result_, 0b1100), dxbc::Src::R(system_temp_result_),
+                   dxbc::Src::R(size_and_is_3d_temp, 0b01000100));
+          snap_size = dxbc::Src::R(system_temp_result_, 0b11101110);
+        }
+        a_.OpMul(dxbc::Dest::R(system_temp_result_, 0b0011), dxbc::Src::R(coord_and_sampler_temp),
+                 snap_size);
+        a_.OpRoundNI(dxbc::Dest::R(system_temp_result_, 0b0011), dxbc::Src::R(system_temp_result_));
+        a_.OpAdd(dxbc::Dest::R(system_temp_result_, 0b0011), dxbc::Src::R(system_temp_result_),
+                 dxbc::Src::LF(0.5f));
+        a_.OpDiv(dxbc::Dest::R(coord_and_sampler_temp, 0b0011), dxbc::Src::R(system_temp_result_),
+                 snap_size);
+        a_.OpElse();
+        a_.OpDiv(dxbc::Dest::R(system_temp_result_, 0b0011), dxbc::Src::LF(kTextureCoordEpsilon),
+                 dxbc::Src::R(size_and_is_3d_temp));
+        a_.OpAdd(dxbc::Dest::R(coord_and_sampler_temp, 0b0011), dxbc::Src::R(coord_and_sampler_temp),
+                 dxbc::Src::R(system_temp_result_));
+        a_.OpEndIf();
       }
 
       // Break result register dependencies because textures will be sampled
