@@ -24,6 +24,7 @@ set(REXGPU_XENOS_SOURCES
     primitive_processor.cpp
     pipeline/render_target/cache.cpp
     shared_memory.cpp
+    resolve_readback_guard.cpp
     pipeline/texture/cache.cpp
     pipeline/shader/interpreter.cpp
     pipeline/shader/translator.cpp

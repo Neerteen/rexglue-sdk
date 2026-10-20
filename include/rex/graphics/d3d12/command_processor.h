@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <deque>
 #include <memory>
 #include <optional>
@@ -34,6 +35,7 @@
 #include <rex/graphics/pipeline/shader/dxbc.h>
 #include <rex/graphics/pipeline/shader/dxbc_translator.h>
 #include <rex/graphics/registers.h>
+#include <rex/graphics/resolve_readback_guard.h>
 #include <rex/graphics/util/draw.h>
 #include <rex/graphics/xenos.h>
 #include <rex/system/kernel_state.h>
@@ -219,6 +221,8 @@ class D3D12CommandProcessor : public CommandProcessor {
                  IndexBufferInfo* index_buffer_info, bool major_mode_explicit) override;
   bool IssueCopy() override;
 
+  void ServiceThreadRequests() override;
+
  private:
   static constexpr uint32_t kQueueFrames = 3;
 
@@ -366,6 +370,12 @@ class D3D12CommandProcessor : public CommandProcessor {
   bool UpdateBindings(const D3D12Shader* vertex_shader, const D3D12Shader* pixel_shader,
                       ID3D12RootSignature* root_signature, bool shared_memory_is_uav);
   bool IssueCopy_ReadbackResolvePath();
+  // readback_resolve = "lazy": whether this resolve should leave its data on the GPU until the CPU
+  // accesses it (initializes resolve_readback_guard_ on first use).
+  bool UseLazyResolveReadback();
+  // Copies the GPU-written pages of the ranges back to guest memory (synchronously). Returns the
+  // number of bytes copied.
+  uint64_t CopyGpuWrittenRangesToGuest(const std::vector<ResolveReadbackGuard::Range>& ranges);
   bool IssueDraw_MemexportReadbackFullPath(uint32_t total_size);
   bool IssueDraw_MemexportReadbackFastPath(uint32_t total_size);
 
@@ -647,6 +657,20 @@ class D3D12CommandProcessor : public CommandProcessor {
   uint32_t readback_buffer_size_ = 0;
   std::unordered_map<uint64_t, ReadbackBuffer> readback_buffers_;
   std::unordered_map<uint64_t, ReadbackBuffer> memexport_readback_buffers_;
+
+  ResolveReadbackGuard resolve_readback_guard_;
+  bool resolve_readback_guard_failed_ = false;
+  std::vector<ResolveReadbackGuard::Range> lazy_readback_ranges_;
+  // Lazy readback statistics for the log.
+  uint64_t lazy_readback_services_ = 0;
+  uint64_t lazy_readback_ranges_total_ = 0;
+  uint64_t lazy_readback_bytes_ = 0;
+  uint64_t lazy_readback_us_ = 0;
+  uint64_t lazy_readback_logged_services_ = 0;
+  std::chrono::steady_clock::time_point lazy_readback_last_log_;
+  // Requests wait while a guest occlusion query is active (ServiceThreadRequests).
+  bool lazy_readback_deferred_ = false;
+  std::chrono::steady_clock::time_point lazy_readback_deferred_since_;
 
   static constexpr uint32_t kMaxOcclusionQueries = 8192;
   Microsoft::WRL::ComPtr<ID3D12QueryHeap> occlusion_query_heap_;

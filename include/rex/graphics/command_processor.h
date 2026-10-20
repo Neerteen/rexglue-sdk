@@ -44,6 +44,8 @@ enum class ReadbackResolveMode {
   kFast,
   kSome,
   kFull,
+  // Copied back only when the CPU accesses the destination (backends without support use kFast).
+  kLazy,
 };
 
 struct SwapState {
@@ -169,6 +171,17 @@ class CommandProcessor {
   virtual void PrepareForWait();
   virtual void ReturnFromWait();
 
+  // Work other threads wait for on this thread (such as copying GPU-written data back to guest
+  // memory for a CPU access). A requester sets thread_requests_pending_ and signals
+  // write_ptr_index_event_; the requests are serviced between packets, while waiting for commands
+  // and in WAIT_REG_MEM.
+  virtual void ServiceThreadRequests() {}
+  void ServiceThreadRequestsIfPending() {
+    if (thread_requests_pending_.load(std::memory_order_acquire)) {
+      ServiceThreadRequests();
+    }
+  }
+
   uint32_t ExecutePrimaryBuffer(uint32_t start_index, uint32_t end_index);
   virtual void OnPrimaryBufferEnd() {}
   void ExecuteIndirectBuffer(uint32_t ptr, uint32_t length);
@@ -254,6 +267,8 @@ class CommandProcessor {
 
   std::unique_ptr<rex::thread::Event> write_ptr_index_event_;
   std::atomic<uint32_t> write_ptr_index_;
+
+  std::atomic<bool> thread_requests_pending_{false};
 
   // Some titles submit writes beyond the emulated register file range in PM4
   // packets. Preserve these values so dependent packet logic can still observe

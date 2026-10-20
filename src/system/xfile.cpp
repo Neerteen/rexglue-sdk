@@ -177,6 +177,19 @@ X_STATUS XFile::ReadInternal(uint32_t buffer_guest_address, uint32_t buffer_leng
                                         memory::PageAccess::kReadWrite) {
           result = X_STATUS_ACCESS_VIOLATION;
         } else {
+          if (buffer_physical_heap) {
+            // The pages at the ends of the buffer keep data the read doesn't overwrite, while the
+            // invalidation below drops the GPU copy of whole pages. If the GPU wrote them and the
+            // data isn't in guest memory yet (readback_resolve = "lazy" guards such pages),
+            // reading them through the guest view gets it back first.
+            if (buffer_guest_address & 0xFFF) {
+              (void)*memory()->TranslateVirtual<const volatile uint8_t*>(buffer_guest_address);
+            }
+            if ((buffer_guest_high_address & 0xFFF) != 0xFFF) {
+              (void)*memory()->TranslateVirtual<const volatile uint8_t*>(
+                  buffer_guest_high_address);
+            }
+          }
           result = file_->ReadSync(
               std::span<uint8_t>(
                   buffer_physical_heap
@@ -284,10 +297,31 @@ X_STATUS XFile::Write(uint32_t buffer_guest_address, uint32_t buffer_length, uin
     byte_offset = position_;
   }
 
+  const uint8_t* buffer = memory()->TranslateVirtual(buffer_guest_address);
+  // The host system reads the buffer directly. In physical memory, a page with PAGE_GUARD
+  // (readback_resolve = "lazy": resolve data not copied back yet) would make that read fail instead
+  // of raising the exception that copies the data back, so read a byte of each page here first.
+  if (buffer_length && UINT32_MAX - buffer_guest_address >= buffer_length - 1) {
+    uint32_t buffer_guest_high_address = buffer_guest_address + buffer_length - 1;
+    rex::memory::BaseHeap* heap = memory()->LookupHeap(buffer_guest_address);
+    if (heap && heap->heap_type() == memory::HeapType::kGuestPhysical &&
+        heap == memory()->LookupHeap(buffer_guest_high_address) &&
+        heap->QueryRangeAccess(buffer_guest_address, buffer_guest_high_address) !=
+            memory::PageAccess::kNoAccess) {
+      for (uint32_t address = buffer_guest_address;;) {
+        (void)*memory()->TranslateVirtual<const volatile uint8_t*>(address);
+        uint32_t next_page = (address & ~uint32_t(0xFFF)) + 0x1000;
+        if (!next_page || next_page > buffer_guest_high_address) {
+          break;
+        }
+        address = next_page;
+      }
+    }
+  }
+
   size_t bytes_written = 0;
-  X_STATUS result = file_->WriteSync(
-      std::span<const uint8_t>(memory()->TranslateVirtual(buffer_guest_address), buffer_length),
-      size_t(byte_offset), &bytes_written);
+  X_STATUS result = file_->WriteSync(std::span<const uint8_t>(buffer, buffer_length),
+                                     size_t(byte_offset), &bytes_written);
   if (XSUCCEEDED(result)) {
     position_ += bytes_written;
   }

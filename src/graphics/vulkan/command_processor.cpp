@@ -4423,6 +4423,10 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
   if (readback_mode == ReadbackResolveMode::kDisabled) {
     return true;
   }
+  if (readback_mode == ReadbackResolveMode::kLazy) {
+    // Not implemented in the Vulkan backend.
+    readback_mode = ReadbackResolveMode::kFast;
+  }
 
   auto ensure_readback_slot = [&](ReadbackBuffer& readback, uint32_t index, uint32_t size) -> bool {
     if (readback.buffers[index] != VK_NULL_HANDLE && size <= readback.sizes[index] &&

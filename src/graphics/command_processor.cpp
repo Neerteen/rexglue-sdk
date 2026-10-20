@@ -50,8 +50,10 @@ REXCVAR_DEFINE_STRING(readback_resolve, "none", "GPU",
                       " none: Disable readback (default)\n"
                       " fast: Read previous frame (delayed, copy every frame)\n"
                       " some: Read previous frame (delayed, copy on cache miss)\n"
-                      " full: Immediate sync readback (accurate but stalls)")
-    .allowed({"none", "fast", "some", "full"})
+                      " full: Immediate sync readback (accurate but stalls)\n"
+                      " lazy: Copy back only when the CPU accesses the destination (sync, D3D12 on\n"
+                      "       Windows; elsewhere as fast)")
+    .allowed({"none", "fast", "some", "full", "lazy"})
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_BOOL(readback_resolve_half_pixel_offset, false, "GPU",
@@ -95,6 +97,9 @@ ReadbackResolveMode ParseReadbackResolveMode(std::string_view value) {
   }
   if (value == "full") {
     return ReadbackResolveMode::kFull;
+  }
+  if (value == "lazy") {
+    return ReadbackResolveMode::kLazy;
   }
   return ReadbackResolveMode::kDisabled;
 }
@@ -209,6 +214,7 @@ void CommandProcessor::WorkerThreadMain() {
       pending_fns_.pop();
       fn();
     }
+    ServiceThreadRequestsIfPending();
 
     uint32_t write_ptr_index = write_ptr_index_.load();
     if (write_ptr_index == 0xBAADF00D || read_ptr_index_ == write_ptr_index) {
@@ -230,9 +236,11 @@ void CommandProcessor::WorkerThreadMain() {
         loop_count++;
         write_ptr_index = write_ptr_index_.load();
       } while (worker_running_ && pending_fns_.empty() &&
+               !thread_requests_pending_.load(std::memory_order_acquire) &&
                (write_ptr_index == 0xBAADF00D || read_ptr_index_ == write_ptr_index));
       ReturnFromWait();
-      if (!worker_running_ || !pending_fns_.empty()) {
+      if (!worker_running_ || !pending_fns_.empty() ||
+          thread_requests_pending_.load(std::memory_order_acquire)) {
         continue;
       }
     }
@@ -663,6 +671,7 @@ void CommandProcessor::ExecutePacket(uint32_t ptr, uint32_t count) {
 }
 
 bool CommandProcessor::ExecutePacket(memory::RingBuffer* reader) {
+  ServiceThreadRequestsIfPending();
   const uint32_t packet = reader->ReadAndSwap<uint32_t>();
   const uint32_t packet_type = packet >> 30;
   if (packet == 0) {
@@ -1030,6 +1039,8 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
         break;
     }
     if (!matched) {
+      // The memory may be written by a thread that is waiting for this one.
+      ServiceThreadRequestsIfPending();
       // Wait.
       if (wait >= 0x100) {
         PrepareForWait();

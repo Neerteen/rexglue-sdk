@@ -11,6 +11,7 @@
  */
 
 #include <cstdint>
+#include <functional>
 #include <mutex>
 #include <utility>
 #include <vector>
@@ -94,6 +95,13 @@ class SharedMemory {
   // the pages they touch, the CPU data is properly loaded to the unmodified
   // regions in those pages.
   void RangeWrittenByGpu(uint32_t start, uint32_t length);
+
+  // Calls fn(start, length) for each run of pages within [start, start + length) (clamped to it)
+  // whose data was written by the GPU and not modified by the CPU since - where the GPU copy is
+  // newer than guest memory. Called within the global critical region, so a CPU write to such a
+  // page, which invalidates it there, can't happen meanwhile.
+  void ForEachGpuWrittenRange(uint32_t start, uint32_t length,
+                              const std::function<void(uint32_t, uint32_t)>& fn);
 
  protected:
   SharedMemory(memory::Memory& memory);

@@ -40,6 +40,16 @@ static void UnwatchDestination(void* dst, size_t n) {
   if (address < kPhysicalViewsBase || !memory->IsPhysicalMemoryWatched(address, uint32_t(n))) {
     return;
   }
+  // The pages at the ends of the destination keep data the copy doesn't overwrite, while the
+  // invalidation drops the GPU copy of whole pages. If the GPU wrote them and the data isn't in
+  // guest memory yet (readback_resolve = "lazy" guards such pages), reading them gets it back first.
+  const volatile uint8_t* bytes = static_cast<const volatile uint8_t*>(dst);
+  if (address & 0xFFF) {
+    (void)bytes[0];
+  }
+  if ((address + uint32_t(n)) & 0xFFF) {
+    (void)bytes[n - 1];
+  }
   memory->TriggerPhysicalMemoryCallbacks(rex::thread::global_critical_region::AcquireDirect(),
                                          address, uint32_t(n), true, false);
 }

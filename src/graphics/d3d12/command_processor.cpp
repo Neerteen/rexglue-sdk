@@ -1630,6 +1630,8 @@ void D3D12CommandProcessor::ShutdownContext() {
   AwaitAllQueueOperationsCompletion();
   InvalidateAllVertexBufferResidency();
   ShutdownOcclusionQueryResources();
+  // Releases CPU accesses waiting for data that won't be copied back anymore.
+  resolve_readback_guard_.Shutdown();
 
   ui::d3d12::util::ReleaseAndNull(readback_buffer_);
   readback_buffer_size_ = 0;
@@ -2883,7 +2885,144 @@ bool D3D12CommandProcessor::IssueCopy() {
     return render_target_cache_->Resolve(*memory_, *shared_memory_, *texture_cache_,
                                          written_address, written_length);
   }
+  if (readback_mode == ReadbackResolveMode::kLazy && UseLazyResolveReadback()) {
+    uint32_t written_address, written_length;
+    if (!render_target_cache_->Resolve(*memory_, *shared_memory_, *texture_cache_,
+                                       written_address, written_length)) {
+      return false;
+    }
+    // After Resolve: it marks the range GPU-written and write-watched, which may reprotect pages.
+    resolve_readback_guard_.Arm(written_address, written_length);
+    return true;
+  }
   return IssueCopy_ReadbackResolvePath();
+}
+
+bool D3D12CommandProcessor::UseLazyResolveReadback() {
+  // With draw resolution scaling the resolved data is in the scaled buffer, not in the shared
+  // memory (the readback path downscales it); not supported here, "fast" is used then.
+  if (texture_cache_->IsDrawResolutionScaled()) {
+    return false;
+  }
+  if (resolve_readback_guard_.is_active()) {
+    return true;
+  }
+  if (resolve_readback_guard_failed_) {
+    return false;
+  }
+  if (!resolve_readback_guard_.Initialize(*memory_, thread_requests_pending_,
+                                          *write_ptr_index_event_)) {
+    REXGPU_WARN("readback_resolve lazy is not available, using fast");
+    resolve_readback_guard_failed_ = true;
+    return false;
+  }
+  lazy_readback_last_log_ = std::chrono::steady_clock::now();
+  return true;
+}
+
+void D3D12CommandProcessor::ServiceThreadRequests() {
+  if (!resolve_readback_guard_.is_active()) {
+    thread_requests_pending_.store(false, std::memory_order_release);
+    return;
+  }
+  if (active_occlusion_query_.valid) {
+    // Copying back ends the submission, and with it the host occlusion query - then the guest's
+    // end of the query would disable host queries. Queries last a few draws: wait for the end,
+    // but not for long (the thread that would end it may be the one waiting for the data).
+    auto now = std::chrono::steady_clock::now();
+    if (!lazy_readback_deferred_) {
+      lazy_readback_deferred_ = true;
+      lazy_readback_deferred_since_ = now;
+    }
+    if (now - lazy_readback_deferred_since_ < std::chrono::milliseconds(50)) {
+      return;
+    }
+  }
+  lazy_readback_deferred_ = false;
+  // Cleared before taking the requests: one made after that sets it again for the next call.
+  thread_requests_pending_.store(false, std::memory_order_release);
+  lazy_readback_ranges_.clear();
+  uint64_t ticket = resolve_readback_guard_.TakeRequests(lazy_readback_ranges_);
+  if (!ticket) {
+    return;
+  }
+  auto start = std::chrono::steady_clock::now();
+  uint64_t bytes = 0;
+  if (!lazy_readback_ranges_.empty()) {
+    bytes = CopyGpuWrittenRangesToGuest(lazy_readback_ranges_);
+  }
+  resolve_readback_guard_.Complete(ticket);
+  auto now = std::chrono::steady_clock::now();
+  uint64_t us = uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(now - start).count());
+
+  ++lazy_readback_services_;
+  lazy_readback_ranges_total_ += lazy_readback_ranges_.size();
+  lazy_readback_bytes_ += bytes;
+  lazy_readback_us_ += us;
+  if (lazy_readback_logged_services_ < 8) {
+    ++lazy_readback_logged_services_;
+    const ResolveReadbackGuard::Range& first = lazy_readback_ranges_.empty()
+                                                   ? ResolveReadbackGuard::Range{0, 0}
+                                                   : lazy_readback_ranges_.front();
+    REXGPU_INFO("readback_resolve lazy: CPU access, copied {} bytes of {} range(s) back in {} us "
+                "(first {:08X}+{:X})",
+                bytes, lazy_readback_ranges_.size(), us, first.start, first.length);
+  }
+  if (now - lazy_readback_last_log_ >= std::chrono::seconds(10)) {
+    REXGPU_INFO("readback_resolve lazy: {} CPU accesses, {} ranges, {} KB copied back, {} ms",
+                lazy_readback_services_, lazy_readback_ranges_total_, lazy_readback_bytes_ >> 10,
+                lazy_readback_us_ / 1000);
+    lazy_readback_last_log_ = now;
+  }
+}
+
+uint64_t D3D12CommandProcessor::CopyGpuWrittenRangesToGuest(
+    const std::vector<ResolveReadbackGuard::Range>& ranges) {
+  uint64_t total_size = 0;
+  for (const ResolveReadbackGuard::Range& range : ranges) {
+    total_size += range.length;
+  }
+  if (!total_size || total_size > UINT32_MAX) {
+    return 0;
+  }
+  ID3D12Resource* readback_buffer = RequestReadbackBuffer(uint32_t(total_size));
+  if (!readback_buffer || !BeginSubmission(false)) {
+    return 0;
+  }
+  shared_memory_->UseAsCopySource();
+  SubmitBarriers();
+  ID3D12Resource* shared_memory_buffer = shared_memory_->GetBuffer();
+  uint32_t readback_offset = 0;
+  for (const ResolveReadbackGuard::Range& range : ranges) {
+    deferred_command_list_.D3DCopyBufferRegion(readback_buffer, readback_offset,
+                                               shared_memory_buffer, range.start, range.length);
+    readback_offset += range.length;
+  }
+  if (!AwaitAllQueueOperationsCompletion()) {
+    return 0;
+  }
+
+  D3D12_RANGE readback_range = {0, SIZE_T(total_size)};
+  void* readback_mapping = nullptr;
+  if (FAILED(readback_buffer->Map(0, &readback_range, &readback_mapping))) {
+    return 0;
+  }
+  uint64_t bytes = 0;
+  const uint8_t* readback_bytes = static_cast<const uint8_t*>(readback_mapping);
+  for (const ResolveReadbackGuard::Range& range : ranges) {
+    // Only where the GPU copy is still newer: a range freed or written by the CPU meanwhile keeps
+    // what the CPU put there.
+    shared_memory_->ForEachGpuWrittenRange(
+        range.start, range.length, [&](uint32_t start, uint32_t length) {
+          std::memcpy(memory_->TranslatePhysical(start), readback_bytes + (start - range.start),
+                      length);
+          bytes += length;
+        });
+    readback_bytes += range.length;
+  }
+  D3D12_RANGE readback_write_range = {};
+  readback_buffer->Unmap(0, &readback_write_range);
+  return bytes;
 }
 
 bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
@@ -3070,8 +3209,10 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
   }
 
   ReadbackResolveMode readback_mode = GetReadbackResolveMode(REXCVAR_GET(d3d12_readback_resolve));
-  bool use_delayed_sync =
-      readback_mode == ReadbackResolveMode::kFast || readback_mode == ReadbackResolveMode::kSome;
+  // kLazy gets here only when it's not available.
+  bool use_delayed_sync = readback_mode == ReadbackResolveMode::kFast ||
+                          readback_mode == ReadbackResolveMode::kSome ||
+                          readback_mode == ReadbackResolveMode::kLazy;
   uint32_t read_index = write_index;
   if (use_delayed_sync) {
     read_index = 1 - write_index;

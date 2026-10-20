@@ -272,6 +272,37 @@ void SharedMemory::RangeWrittenByGpu(uint32_t start, uint32_t length) {
   MakeRangeValid(start, length, true);
 }
 
+void SharedMemory::ForEachGpuWrittenRange(uint32_t start, uint32_t length,
+                                          const std::function<void(uint32_t, uint32_t)>& fn) {
+  if (length == 0 || start >= kBufferSize) {
+    return;
+  }
+  length = std::min(length, kBufferSize - start);
+  uint32_t end = start + length;
+  uint32_t page_first = start >> page_size_log2_;
+  uint32_t page_last = (end - 1) >> page_size_log2_;
+
+  auto global_lock = global_critical_region_.Acquire();
+  uint32_t run_first = UINT32_MAX;
+  for (uint32_t page = page_first; page <= page_last + 1; ++page) {
+    bool gpu_written =
+        page <= page_last &&
+        ((system_page_flags_valid_and_gpu_written_[page >> 6] >> (page & 63)) & 1) != 0;
+    if (gpu_written) {
+      if (run_first == UINT32_MAX) {
+        run_first = page;
+      }
+      continue;
+    }
+    if (run_first != UINT32_MAX) {
+      uint32_t run_start = std::max(start, run_first << page_size_log2_);
+      uint32_t run_end = std::min(end, page << page_size_log2_);
+      fn(run_start, run_end - run_start);
+      run_first = UINT32_MAX;
+    }
+  }
+}
+
 bool SharedMemory::AllocateSparseHostGpuMemoryRange(uint32_t offset_allocations,
                                                     uint32_t length_allocations) {
   assert_always(
