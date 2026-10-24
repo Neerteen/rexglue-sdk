@@ -24,6 +24,7 @@
 #include <rex/graphics/command_processor.h>
 #include <rex/graphics/flags.h>
 #include <rex/graphics/graphics_system.h>
+#include <rex/graphics/pipeline/shader/shader.h>
 #include <rex/graphics/pipeline/texture/info.h>
 #include <rex/graphics/sampler_info.h>
 #include <rex/graphics/xenos.h>
@@ -82,11 +83,106 @@ REXCVAR_DEFINE_BOOL(async_shader_compilation, true, "GPU",
                     "pipelines are being prepared.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+// Packet trace of the command processor (ACFA, T6.1): while the number of XE_SWAP packets executed
+// (the guest's VdSwap count) is in [cp_trace_from, cp_trace_from + cp_trace_count), log every draw
+// packet (executed or skipped by its predicate), indirect buffer, LOAD_ALU_CONSTANT and XE_SWAP
+// with the guest physical address of its header and the INDIRECT_BUFFER packets that led to it, so
+// that a draw can be matched with the guest code that wrote it. A game sets them at run time; with
+// cp_trace_count = 0 nothing is logged.
+REXCVAR_DEFINE_INT32(cp_trace_from, 0, "GPU",
+                     "First frame (XE_SWAP packets executed) of the command processor packet trace")
+    .range(0, INT32_MAX)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_INT32(cp_trace_count, 0, "GPU",
+                     "Frames of the command processor packet trace from cp_trace_from (0 = off)")
+    .range(0, INT32_MAX)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_STRING(cp_trace_values, "", "GPU",
+                      "Register blocks whose values each cp_trace draw logs in full, comma-separated: "
+                      "r2000 r2080 r2100 r2180 r2200 r2280 r2300 r2380 ucp fetch vsc psc bool loop")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 namespace rex::graphics {
 
 using namespace rex::graphics::xenos;
 
 namespace {
+
+// cp_trace state of the command processor thread: the guest physical address of the buffer being
+// read, the header of the packet being executed, and the INDIRECT_BUFFER headers above it.
+// Frames are XE_SWAP packets executed: counter_ also counts vblanks (GraphicsSystem::MarkVblank),
+// while the guest's VdSwap calls each put exactly one XE_SWAP into the command stream.
+constexpr uint32_t kCpTraceMaxDepth = 8;
+thread_local uint32_t cp_trace_base = 0;
+thread_local uint32_t cp_trace_packet = 0;
+thread_local uint32_t cp_trace_depth = 0;
+thread_local uint32_t cp_trace_chain[kCpTraceMaxDepth] = {};
+uint32_t cp_trace_swaps = 0;
+
+bool CpTraceFrame() {
+  const int32_t count = REXCVAR_GET(cp_trace_count);
+  if (count <= 0) {
+    return false;
+  }
+  const uint64_t from = uint64_t(uint32_t(REXCVAR_GET(cp_trace_from)));
+  return cp_trace_swaps >= from && cp_trace_swaps < from + uint64_t(count);
+}
+
+std::string CpTraceChain() {
+  std::string out;
+  for (uint32_t i = 0; i < std::min(cp_trace_depth, kCpTraceMaxDepth); ++i) {
+    out += fmt::format("{}{:08X}", i ? "," : "", cp_trace_chain[i]);
+  }
+  return out.empty() ? "-" : out;
+}
+
+// Register blocks hashed for each traced draw ("hb=", in this order): the blocks a Direct3D 9
+// device of the XDK keeps a shadow of, so that a game can compare its shadow with what the draw saw.
+struct CpTraceBlock {
+  const char* name;
+  uint32_t first;
+  uint32_t count;
+};
+constexpr CpTraceBlock kCpTraceBlocks[] = {
+    {"r2000", 0x2000, 16}, {"r2080", 0x2080, 3},  {"r2100", 0x2100, 21},  {"r2180", 0x2180, 5},
+    {"r2200", 0x2200, 12}, {"r2280", 0x2280, 21}, {"r2300", 0x2300, 38},  {"r2380", 0x2380, 8},
+    {"ucp", 0x2388, 24},   {"fetch", 0x4800, 192}, {"vsc", 0x4000, 1024}, {"psc", 0x4400, 1024},
+    {"bool", 0x4900, 8},   {"loop", 0x4908, 32},
+};
+
+// Whether a comma-separated list (cp_trace_values) has the name.
+bool CpTraceListed(std::string_view list, std::string_view name) {
+  while (!list.empty()) {
+    const size_t comma = list.find(',');
+    if (list.substr(0, comma) == name) {
+      return true;
+    }
+    list = comma == std::string_view::npos ? std::string_view() : list.substr(comma + 1);
+  }
+  return false;
+}
+
+// FNV-1a over the little-endian bytes of the register values.
+uint32_t CpTraceHash(const RegisterFile& regs, uint32_t first, uint32_t count) {
+  uint32_t hash = 0x811C9DC5u;
+  for (uint32_t i = 0; i < count; ++i) {
+    const uint32_t value = regs[first + i];
+    for (uint32_t b = 0; b < 4; ++b) {
+      hash = (hash ^ ((value >> (8 * b)) & 0xFF)) * 0x01000193u;
+    }
+  }
+  return hash;
+}
+
+// RAII: the buffer a reader runs over, for the packet addresses of cp_trace.
+class CpTraceBuffer {
+ public:
+  explicit CpTraceBuffer(uint32_t base) : saved_(cp_trace_base) { cp_trace_base = base; }
+  ~CpTraceBuffer() { cp_trace_base = saved_; }
+
+ private:
+  uint32_t saved_;
+};
 
 ReadbackResolveMode ParseReadbackResolveMode(std::string_view value) {
   if (value == "fast") {
@@ -624,6 +720,7 @@ uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t wr
   SCOPE_profile_cpu_f("gpu");
 
   // Execute commands!
+  CpTraceBuffer trace_buffer(primary_buffer_ptr_);
   memory::RingBuffer reader(memory_->TranslatePhysical(primary_buffer_ptr_), primary_buffer_size_);
   reader.set_read_offset(read_index * sizeof(uint32_t));
   reader.set_write_offset(write_index * sizeof(uint32_t));
@@ -645,6 +742,7 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
   SCOPE_profile_cpu_f("gpu");
 
   // Execute commands!
+  CpTraceBuffer trace_buffer(ptr);
   memory::RingBuffer reader(memory_->TranslatePhysical(ptr), count * sizeof(uint32_t));
   reader.set_write_offset(count * sizeof(uint32_t));
   do {
@@ -659,6 +757,7 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
 
 void CommandProcessor::ExecutePacket(uint32_t ptr, uint32_t count) {
   // Execute commands!
+  CpTraceBuffer trace_buffer(ptr);
   memory::RingBuffer reader(memory_->TranslatePhysical(ptr), count * sizeof(uint32_t));
   reader.set_write_offset(count * sizeof(uint32_t));
   do {
@@ -750,12 +849,23 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
     return false;
   }
 
+  // Always kept: an indirect buffer entered before the trace window still has its header address.
+  cp_trace_packet =
+      cp_trace_base + uint32_t((data_start_offset + reader->capacity() - sizeof(uint32_t)) %
+                               reader->capacity());
+  const bool trace = CpTraceFrame();
+
   // & 1 == predicate - when set, we do bin check to see if we should execute
   // the packet. Only type 3 packets are affected.
   // We also skip predicated swaps, as they are never valid (probably?).
   if (packet & 1) {
     bool any_pass = (bin_select_ & bin_mask_) != 0;
     if (!any_pass || opcode == PM4_XE_SWAP) {
+      if (trace && (opcode == PM4_DRAW_INDX || opcode == PM4_DRAW_INDX_2)) {
+        REXGPU_INFO("cp_trace f={} skip at={:08X} chain={} op={:02X} bins={:016X}",
+                    cp_trace_swaps, cp_trace_packet, CpTraceChain(), opcode,
+                    bin_select_ & bin_mask_);
+      }
       reader->AdvanceRead(count * sizeof(uint32_t));
       return true;
     }
@@ -969,7 +1079,12 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
 
   IssueSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
 
+  if (CpTraceFrame()) {
+    REXGPU_INFO("cp_trace f={} swap at={:08X} chain={} front={:08X}", cp_trace_swaps,
+                cp_trace_packet, CpTraceChain(), frontbuffer_ptr);
+  }
   ++counter_;
+  ++cp_trace_swaps;
   return true;
 }
 
@@ -980,7 +1095,18 @@ bool CommandProcessor::ExecutePacketType3_INDIRECT_BUFFER(memory::RingBuffer* re
   uint32_t list_length = reader->ReadAndSwap<uint32_t>();
   assert_zero(list_length & ~0xFFFFF);
   list_length &= 0xFFFFF;
+  const uint32_t packet_address = cp_trace_packet;
+  if (CpTraceFrame()) {
+    REXGPU_INFO("cp_trace f={} ib at={:08X} chain={} -> {:08X}+{:X}", cp_trace_swaps,
+                packet_address, CpTraceChain(), GpuToCpu(list_ptr),
+                list_length * sizeof(uint32_t));
+  }
+  if (cp_trace_depth < kCpTraceMaxDepth) {
+    cp_trace_chain[cp_trace_depth] = packet_address;
+  }
+  ++cp_trace_depth;
   ExecuteIndirectBuffer(GpuToCpu(list_ptr), list_length);
+  --cp_trace_depth;
   return true;
 }
 
@@ -1379,6 +1505,55 @@ bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32
   // we don't support yet.
   reader->AdvanceRead(count_remaining * sizeof(uint32_t));
 
+  if (CpTraceFrame()) {
+    // The registers the draw sees, named as in the guest trace of the game (shadow registers of
+    // its Direct3D device), fetch constant 0, the shaders' ucode hashes and a hash of each block
+    // of kCpTraceBlocks.
+    const RegisterFile& regs = *register_file_;
+    std::string text = fmt::format(
+        "cp_trace f={} draw at={:08X} chain={} op={} init={:08X} prim={} src={} n={}",
+        cp_trace_swaps, cp_trace_packet, CpTraceChain(), opcode_name, vgt_draw_initiator.value,
+        uint32_t(vgt_draw_initiator.prim_type), uint32_t(vgt_draw_initiator.source_select),
+        uint32_t(vgt_draw_initiator.num_indices));
+    if (is_indexed) {
+      text += fmt::format(" dma={:08X}+{:X}", index_buffer_info.guest_base,
+                          index_buffer_info.length);
+    }
+    text += fmt::format(
+        " surf={:08X} color={:08X} depth={:08X} wofs={:08X} mask={:08X} vx={:08X} prog={:08X} "
+        "dctl={:08X} mode={:08X} copy={:08X} dest={:08X} f0=",
+        regs[XE_GPU_REG_RB_SURFACE_INFO], regs[XE_GPU_REG_RB_COLOR_INFO],
+        regs[XE_GPU_REG_RB_DEPTH_INFO], regs[XE_GPU_REG_PA_SC_WINDOW_OFFSET],
+        regs[XE_GPU_REG_RB_COLOR_MASK], regs[XE_GPU_REG_PA_CL_VPORT_XSCALE],
+        regs[XE_GPU_REG_SQ_PROGRAM_CNTL], regs[XE_GPU_REG_RB_DEPTHCONTROL],
+        regs[XE_GPU_REG_RB_MODECONTROL], regs[XE_GPU_REG_RB_COPY_CONTROL],
+        regs[XE_GPU_REG_RB_COPY_DEST_BASE]);
+    for (uint32_t i = 0; i < 6; ++i) {
+      text += fmt::format("{}{:08X}", i ? ":" : "", regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + i]);
+    }
+    const auto viz = register_file_->Get<reg::PA_SC_VIZ_QUERY>();
+    text += fmt::format(" vs={:016X} ps={:016X} bins={:016X} viz={}",
+                        active_vertex_shader_ ? active_vertex_shader_->ucode_data_hash() : 0,
+                        active_pixel_shader_ ? active_pixel_shader_->ucode_data_hash() : 0,
+                        bin_select_ & bin_mask_,
+                        (viz.viz_query_ena && viz.kill_pix_post_hi_z) ? "kill" : "-");
+    text += " hb=";
+    for (const CpTraceBlock& block : kCpTraceBlocks) {
+      text += fmt::format("{}{:08X}", &block == kCpTraceBlocks ? "" : ":",
+                          CpTraceHash(regs, block.first, block.count));
+    }
+    const std::string values = REXCVAR_GET(cp_trace_values);
+    for (const CpTraceBlock& block : kCpTraceBlocks) {
+      if (!values.empty() && CpTraceListed(values, block.name)) {
+        text += fmt::format(" v.{}=", block.name);
+        for (uint32_t i = 0; i < block.count; ++i) {
+          text += fmt::format("{:08X}", regs[block.first + i]);
+        }
+      }
+    }
+    REXGPU_INFO("{}", text);
+  }
+
   if (draw_succeeded) {
     auto viz_query = register_file_->Get<reg::PA_SC_VIZ_QUERY>();
     if (!(viz_query.viz_query_ena && viz_query.kill_pix_post_hi_z)) {
@@ -1491,6 +1666,10 @@ bool CommandProcessor::ExecutePacketType3_LOAD_ALU_CONSTANT(memory::RingBuffer* 
   size_dwords &= 0xFFF;
   uint32_t type = (offset_type >> 16) & 0xFF;
   uint32_t* xlat_address = memory_->TranslatePhysical<uint32_t*>(address);
+  if (CpTraceFrame()) {
+    REXGPU_INFO("cp_trace f={} load at={:08X} chain={} type={} index={:X} n={:X} src={:08X}",
+                cp_trace_swaps, cp_trace_packet, CpTraceChain(), type, index, size_dwords, address);
+  }
   switch (type) {
     case 0:  // ALU
       WriteALURangeFromMem(index, xlat_address, size_dwords);
